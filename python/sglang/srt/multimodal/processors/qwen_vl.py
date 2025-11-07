@@ -302,8 +302,13 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         rid = getattr(request_obj, "rid", "anonymous_rid")
 
         # Qwen-specific: resize images if they are raw Image objects
+        # Offload resizing to the IO thread pool to avoid blocking the event loop.
         if base_output.images and isinstance(base_output.images[0], Image.Image):
-            resize_tasks = [resize_image_async(image) for image in base_output.images]
+            loop = asyncio.get_event_loop()
+            resize_tasks = [
+                loop.run_in_executor(self.io_executor, resize_image, image)
+                for image in base_output.images
+            ]
             base_output.images = await asyncio.gather(*resize_tasks)
 
         video_metadata = None
@@ -316,16 +321,22 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         preprocess_time = time.perf_counter()
 
         # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
+        # Offload heavy HF processor path to thread pool to avoid blocking the event loop.
+        loop = asyncio.get_event_loop()
         if self.hf_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
-            mm_items, input_ids, ret = self.process_and_combine_mm_data(
-                base_output,
-                self.mm_tokens,
-                video_metadata=video_metadata,
-                do_sample_frames=False,
+            mm_items, input_ids, ret = await loop.run_in_executor(
+                self.io_executor,
+                lambda: self.process_and_combine_mm_data(
+                    base_output,
+                    self.mm_tokens,
+                    video_metadata=video_metadata,
+                    do_sample_frames=False,
+                ),
             )
         else:
-            mm_items, input_ids, ret = self.process_and_combine_mm_data(
-                base_output, self.mm_tokens
+            mm_items, input_ids, ret = await loop.run_in_executor(
+                self.io_executor,
+                lambda: self.process_and_combine_mm_data(base_output, self.mm_tokens),
             )
 
         audio_feature_lengths = None
