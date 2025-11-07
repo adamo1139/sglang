@@ -125,6 +125,35 @@ def _get_http_session():
         return _HTTP_SESSION
 
 
+# Shared async HTTP client for true concurrent downloads
+_ASYNC_HTTP_CLIENT = None
+_ASYNC_HTTP_CLIENT_LOCK = asyncio.Lock()
+
+
+async def _get_async_http_client():
+    global _ASYNC_HTTP_CLIENT
+    if _ASYNC_HTTP_CLIENT is not None:
+        return _ASYNC_HTTP_CLIENT
+    
+    async with _ASYNC_HTTP_CLIENT_LOCK:
+        if _ASYNC_HTTP_CLIENT is not None:
+            return _ASYNC_HTTP_CLIENT
+        
+        try:
+            import httpx
+            pool_size = int(os.getenv("SGLANG_HTTP_POOL_MAXSIZE", "256"))
+            limits = httpx.Limits(
+                max_keepalive_connections=pool_size,
+                max_connections=pool_size,
+                keepalive_expiry=30.0
+            )
+            _ASYNC_HTTP_CLIENT = httpx.AsyncClient(limits=limits, timeout=30.0)
+            return _ASYNC_HTTP_CLIENT
+        except ImportError:
+            logger.warning("httpx not installed, falling back to sync requests in thread pool")
+            return None
+
+
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
 
@@ -907,6 +936,42 @@ def load_image(
             image.load()  # Force loading to avoid issues after closing the stream
         finally:
             response.close()
+    elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
+        image = Image.open(image_file)
+    elif image_file.startswith("data:"):
+        image_file = image_file.split(",")[1]
+        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
+    elif isinstance(image_file, str):
+        image = Image.open(BytesIO(pybase64.b64decode(image_file, validate=True)))
+    else:
+        raise ValueError(f"Invalid image: {image_file}")
+
+    return image, image_size
+
+
+async def load_image_async(
+    image_file: Union[Image.Image, str, ImageData, bytes],
+) -> tuple[Image.Image, tuple[int, int]]:
+    """Async version of load_image that uses httpx for URL downloads."""
+    if isinstance(image_file, ImageData):
+        image_file = image_file.url
+
+    image = image_size = None
+    if isinstance(image_file, Image.Image):
+        image = image_file
+        image_size = (image.width, image.height)
+    elif isinstance(image_file, bytes):
+        image = Image.open(BytesIO(image_file))
+    elif image_file.startswith("http://") or image_file.startswith("https://"):
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
+        client = await _get_async_http_client()
+        if client is None:
+            return load_image(image_file)
+        
+        response = await client.get(image_file, timeout=timeout)
+        response.raise_for_status()
+        image = Image.open(BytesIO(response.content))
+        image.load()
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         image = Image.open(image_file)
     elif image_file.startswith("data:"):

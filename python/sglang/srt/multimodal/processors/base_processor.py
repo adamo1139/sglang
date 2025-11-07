@@ -1,3 +1,4 @@
+import asyncio
 import concurrent
 import concurrent.futures
 import dataclasses
@@ -18,6 +19,7 @@ from sglang.srt.utils import (
     is_npu,
     load_audio,
     load_image,
+    load_image_async,
     load_video,
     logger,
 )
@@ -30,6 +32,29 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
 _is_npu = is_npu()
 
 SGL_USE_CUDA_IPC = get_bool_env_var("SGLANG_USE_CUDA_IPC_TRANSPORT")
+
+
+class _AsyncTaskWrapper:
+    """Wrapper to make asyncio.Task compatible with concurrent.futures.Future interface."""
+    
+    def __init__(self, task, loop):
+        self._task = task
+        self._loop = loop
+    
+    def result(self, timeout=None):
+        """Wait for the task to complete and return result (blocking from sync code)."""
+        if self._task.done():
+            return self._task.result()
+        
+        try:
+            running_loop = asyncio.get_running_loop()
+            if running_loop == self._loop:
+                raise RuntimeError("Cannot call .result() from same event loop")
+        except RuntimeError:
+            pass
+        
+        future = asyncio.run_coroutine_threadsafe(self._task, self._loop)
+        return future.result(timeout=timeout)
 
 
 @dataclasses.dataclass
@@ -348,6 +373,35 @@ class BaseMultimodalProcessor(ABC):
         except Exception as e:
             raise RuntimeError(f"Error while loading data {data}: {e}")
 
+    @staticmethod
+    async def _load_single_item_async(
+        data,
+        modality: Modality,
+        frame_count_limit=None,
+        audio_sample_rate: Optional[int] = None,
+        discard_alpha_channel=True,
+    ):
+        """
+        Async version of _load_single_item for URL downloads.
+        
+        Uses async HTTP client for image URLs, enabling hundreds of concurrent downloads.
+        """
+        if isinstance(data, dict):
+            return data
+        try:
+            if modality == Modality.IMAGE:
+                img, _ = await load_image_async(data)
+                if discard_alpha_channel and img.mode != "RGB":
+                    img = img.convert("RGB")
+                return img
+            elif modality == Modality.VIDEO:
+                return load_video(data, frame_count_limit)
+            elif modality == Modality.AUDIO:
+                return load_audio(data, audio_sample_rate)
+
+        except Exception as e:
+            raise RuntimeError(f"Error while loading data {data}: {e}")
+
     def submit_data_loading_tasks(
         self,
         text_parts: List[str],
@@ -394,16 +448,47 @@ class BaseMultimodalProcessor(ABC):
                             "Mismatch between image tokens and estimated frame counts."
                         )
 
-                futures.append(
-                    self.io_executor.submit(
-                        BaseMultimodalProcessor._load_single_item,
-                        data,
-                        modality,
-                        frame_count_limit,
-                        audio_sample_rate,
-                        discard_alpha_channel,
-                    )
+                is_url = (
+                    modality == Modality.IMAGE
+                    and isinstance(data, str)
+                    and (data.startswith("http://") or data.startswith("https://"))
                 )
+                
+                if is_url:
+                    try:
+                        loop = asyncio.get_running_loop()
+                        task = asyncio.create_task(
+                            BaseMultimodalProcessor._load_single_item_async(
+                                data,
+                                modality,
+                                frame_count_limit,
+                                audio_sample_rate,
+                                discard_alpha_channel,
+                            )
+                        )
+                        futures.append(_AsyncTaskWrapper(task, loop))
+                    except RuntimeError:
+                        futures.append(
+                            self.io_executor.submit(
+                                BaseMultimodalProcessor._load_single_item,
+                                data,
+                                modality,
+                                frame_count_limit,
+                                audio_sample_rate,
+                                discard_alpha_channel,
+                            )
+                        )
+                else:
+                    futures.append(
+                        self.io_executor.submit(
+                            BaseMultimodalProcessor._load_single_item,
+                            data,
+                            modality,
+                            frame_count_limit,
+                            audio_sample_rate,
+                            discard_alpha_channel,
+                        )
+                    )
                 task_info.append((modality, data, frame_count_limit))
 
         for modality, iterator in data_iterators.items():
