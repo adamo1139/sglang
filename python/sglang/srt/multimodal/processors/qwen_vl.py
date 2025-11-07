@@ -22,7 +22,6 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
-from sglang.srt.utils import load_image_async
 from sglang.utils import logger
 
 IMAGE_FACTOR = 28
@@ -292,28 +291,9 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         **kwargs,
     ):
         entry_time = time.perf_counter()
-        
-        processed_image_data = image_data
-        if image_data:
-            url_images = [
-                (i, img)
-                for i, img in enumerate(image_data)
-                if isinstance(img, str) and (img.startswith("http://") or img.startswith("https://"))
-            ]
-            
-            if url_images:
-                load_tasks = [load_image_async(img) for _, img in url_images]
-                loaded_images = await asyncio.gather(*load_tasks)
-                
-                processed_image_data = list(image_data)
-                for (idx, _), (pil_img, _) in zip(url_images, loaded_images):
-                    processed_image_data[idx] = pil_img
-        
-        url_load_time = time.perf_counter()
-        
         base_output = self.load_mm_data(
             prompt=input_text,
-            image_data=processed_image_data,
+            image_data=image_data,
             video_data=request_obj.video_data,
             audio_data=request_obj.audio_data,
             multimodal_tokens=self.mm_tokens,
