@@ -98,6 +98,32 @@ logger = logging.getLogger(__name__)
 show_time_cost = False
 time_infos = {}
 
+# Shared HTTP session for connection pooling across threads
+_HTTP_SESSION_LOCK = threading.Lock()
+_HTTP_SESSION = None
+
+
+def _get_http_session():
+    global _HTTP_SESSION
+    if _HTTP_SESSION is not None:
+        return _HTTP_SESSION
+    with _HTTP_SESSION_LOCK:
+        if _HTTP_SESSION is not None:
+            return _HTTP_SESSION
+        session = requests.Session()
+        try:
+            from requests.adapters import HTTPAdapter
+
+            pool_size = int(os.getenv("SGLANG_HTTP_POOL_MAXSIZE", "128"))
+            adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+        except Exception:
+            # Fall back silently if adapters are unavailable
+            pass
+        _HTTP_SESSION = session
+        return _HTTP_SESSION
+
 
 HIP_FP8_E4M3_FNUZ_MAX = 224.0
 
@@ -828,9 +854,13 @@ def load_audio(
         )
     elif audio_file.startswith("http://") or audio_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
-        response = requests.get(audio_file, stream=True, timeout=timeout)
-        audio_file = BytesIO(response.content)
-        response.close()
+        session = _get_http_session()
+        response = session.get(audio_file, timeout=timeout)
+        try:
+            response.raise_for_status()
+            audio_file = BytesIO(response.content)
+        finally:
+            response.close()
         audio, original_sr = sf.read(audio_file)
     elif isinstance(audio_file, str):
         audio, original_sr = sf.read(audio_file)
@@ -869,10 +899,11 @@ def load_image(
         image = Image.open(BytesIO(image_file))
     elif image_file.startswith("http://") or image_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, stream=True, timeout=timeout)
+        session = _get_http_session()
+        response = session.get(image_file, timeout=timeout)
         try:
             response.raise_for_status()
-            image = Image.open(response.raw)
+            image = Image.open(BytesIO(response.content))
             image.load()  # Force loading to avoid issues after closing the stream
         finally:
             response.close()
@@ -894,8 +925,13 @@ def get_image_bytes(image_file: Union[str, bytes]):
         return image_file
     elif image_file.startswith("http://") or image_file.startswith("https://"):
         timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
-        response = requests.get(image_file, timeout=timeout)
-        return response.content
+        session = _get_http_session()
+        response = session.get(image_file, timeout=timeout)
+        try:
+            response.raise_for_status()
+            return response.content
+        finally:
+            response.close()
     elif image_file.lower().endswith(("png", "jpg", "jpeg", "webp", "gif")):
         with open(image_file, "rb") as f:
             return f.read()
@@ -931,7 +967,8 @@ def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
         elif isinstance(video_file, str):
             if video_file.startswith(("http://", "https://")):
                 timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
-                response = requests.get(video_file, stream=True, timeout=timeout)
+                session = _get_http_session()
+                response = session.get(video_file, stream=True, timeout=timeout)
                 response.raise_for_status()
                 tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
                 for chunk in response.iter_content(chunk_size=8192):
