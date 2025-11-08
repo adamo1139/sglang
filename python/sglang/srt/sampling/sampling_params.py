@@ -15,15 +15,12 @@
 
 import logging
 import sre_parse
-import threading
 from typing import Any, Dict, List, Optional, Union
 
 _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
 
 logger = logging.getLogger(__name__)
-
-_tokenizer_lock = threading.Lock()
 
 
 class SamplingParams:
@@ -172,8 +169,7 @@ class SamplingParams:
             stop_str_max_len = 0
             for stop_str in self.stop_strs:
                 if tokenizer is not None:
-                    with _tokenizer_lock:
-                        stop_str_ids = tokenizer.encode(stop_str, add_special_tokens=False)
+                    stop_str_ids = tokenizer.encode(stop_str, add_special_tokens=False)
                     stop_str_max_len = max(stop_str_max_len, len(stop_str_ids))
                 else:
                     stop_str_max_len = max(stop_str_max_len, len(stop_str))
