@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
+import threading
 import torch
 from PIL import Image
 from transformers import BaseImageProcessorFast
@@ -30,6 +31,11 @@ from sglang.srt.utils.cuda_ipc_transport_utils import (
 _is_npu = is_npu()
 
 SGL_USE_CUDA_IPC = get_bool_env_var("SGLANG_USE_CUDA_IPC_TRANSPORT")
+
+# Guard for HF AutoProcessor fast tokenizer path used inside processor.__call__.
+# Under high concurrency, fast tokenizers can raise "Already borrowed" when
+# padding/truncation settings are changed concurrently. Serialize those calls.
+_FAST_PROCESSOR_TOKENIZER_LOCK = threading.Lock()
 
 
 @dataclasses.dataclass
@@ -264,12 +270,13 @@ class BaseMultimodalProcessor(ABC):
             }:
                 # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
                 kwargs["device"] = "npu"
-        result = processor.__call__(
-            text=[input_text],
-            padding=True,
-            return_tensors="pt",
-            **kwargs,
-        )
+        with _FAST_PROCESSOR_TOKENIZER_LOCK:
+            result = processor.__call__(
+                text=[input_text],
+                padding=True,
+                return_tensors="pt",
+                **kwargs,
+            )
         if not self.server_args.keep_mm_feature_on_device:
             # move feature tensors to cpu
             for feature_name in self.FEATURE_NAMES:
