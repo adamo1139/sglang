@@ -574,7 +574,12 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
         else:
             logger.debug(f"Using regular tokenizer for {len(tokenizer_input)} inputs")
-            encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
+            # HF fast tokenizers are not fully thread-safe for some stateful ops
+            # (padding/truncation config). Guard the call to avoid "Already borrowed".
+            if not hasattr(self, "_fast_tok_lock"):
+                self._fast_tok_lock = threading.Lock()
+            with self._fast_tok_lock:
+                encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
             input_ids = encoded["input_ids"]
             token_type_ids = encoded.get("token_type_ids") if is_cross_encoder else None
 
