@@ -175,7 +175,8 @@ class SamplingParams:
             stop_str_max_len = 0
             for stop_str in self.stop_strs:
                 if tokenizer is not None:
-                    with _TOKENIZER_LOCK:
+                    lock = getattr(tokenizer, "_fast_lock", _TOKENIZER_LOCK)
+                    with lock:
                         stop_str_ids = tokenizer.encode(
                             stop_str, add_special_tokens=False
                         )

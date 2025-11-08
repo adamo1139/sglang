@@ -574,11 +574,13 @@ class TokenizerManager(TokenizerCommunicatorMixin):
             )
         else:
             logger.debug(f"Using regular tokenizer for {len(tokenizer_input)} inputs")
-            # HF fast tokenizers are not fully thread-safe for some stateful ops
-            # (padding/truncation config). Guard the call to avoid "Already borrowed".
-            if not hasattr(self, "_fast_tok_lock"):
-                self._fast_tok_lock = threading.Lock()
-            with self._fast_tok_lock:
+            # Guard tokenizer calls with a shared lock carried on the tokenizer if available.
+            tok_lock = getattr(self.tokenizer, "_fast_lock", None)
+            if tok_lock is None:
+                if not hasattr(self, "_fast_tok_lock"):
+                    self._fast_tok_lock = threading.RLock()
+                tok_lock = self._fast_tok_lock
+            with tok_lock:
                 encoded = self.tokenizer(tokenizer_input, **tokenizer_kwargs)
             input_ids = encoded["input_ids"]
             token_type_ids = encoded.get("token_type_ids") if is_cross_encoder else None

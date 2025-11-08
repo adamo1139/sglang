@@ -270,7 +270,11 @@ class BaseMultimodalProcessor(ABC):
             }:
                 # Note: for qwen-vl, processor has some reshape issue because of dims restriction on Ascend.
                 kwargs["device"] = "npu"
-        with _FAST_PROCESSOR_TOKENIZER_LOCK:
+        # Prefer a shared lock attached to the underlying tokenizer if available
+        tok = getattr(processor, "tokenizer", None)
+        tok_lock = getattr(tok, "_fast_lock", None)
+        lock = tok_lock or _FAST_PROCESSOR_TOKENIZER_LOCK
+        with lock:
             result = processor.__call__(
                 text=[input_text],
                 padding=True,

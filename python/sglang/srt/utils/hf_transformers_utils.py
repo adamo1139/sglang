@@ -21,6 +21,7 @@ import tempfile
 import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type, Union
+import threading
 
 import torch
 from huggingface_hub import snapshot_download
@@ -436,6 +437,9 @@ def get_tokenizer(
         )
 
     attach_additional_stop_token_ids(tokenizer)
+    # Attach a shared lock to guard fast tokenizer calls under concurrency
+    if not hasattr(tokenizer, "_fast_lock"):
+        tokenizer._fast_lock = threading.RLock()
     return tokenizer
 
 
@@ -522,6 +526,9 @@ def get_processor(
     tokenizer = get_tokenizer_from_processor(processor)
 
     attach_additional_stop_token_ids(tokenizer)
+    # Attach a shared lock to guard fast tokenizer calls under concurrency
+    if not hasattr(tokenizer, "_fast_lock"):
+        tokenizer._fast_lock = threading.RLock()
     return processor
 
 
