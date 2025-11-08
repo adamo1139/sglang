@@ -14,6 +14,7 @@
 """Sampling parameters for text generation."""
 
 import logging
+import threading
 import sre_parse
 from typing import Any, Dict, List, Optional, Union
 
@@ -21,6 +22,11 @@ _SAMPLING_EPS = 1e-6
 TOP_K_ALL = 1 << 30
 
 logger = logging.getLogger(__name__)
+
+# Fast tokenizers from HF are not thread-safe for some stateful ops
+# (e.g., set_truncation_and_padding inside encode paths). Guard access
+# here to avoid "Already borrowed" runtime errors under high concurrency.
+_TOKENIZER_LOCK = threading.Lock()
 
 
 class SamplingParams:
@@ -169,7 +175,10 @@ class SamplingParams:
             stop_str_max_len = 0
             for stop_str in self.stop_strs:
                 if tokenizer is not None:
-                    stop_str_ids = tokenizer.encode(stop_str, add_special_tokens=False)
+                    with _TOKENIZER_LOCK:
+                        stop_str_ids = tokenizer.encode(
+                            stop_str, add_special_tokens=False
+                        )
                     stop_str_max_len = max(stop_str_max_len, len(stop_str_ids))
                 else:
                     stop_str_max_len = max(stop_str_max_len, len(stop_str))
