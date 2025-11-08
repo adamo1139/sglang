@@ -394,8 +394,14 @@ class BaseMultimodalProcessor(ABC):
                             "Mismatch between image tokens and estimated frame counts."
                         )
 
+                # Use ProcessPool for IMAGE/VIDEO (CPU-bound decode/resize), ThreadPool for others
+                exec_for_task = (
+                    self.cpu_executor
+                    if modality in (Modality.IMAGE, Modality.VIDEO)
+                    else self.io_executor
+                )
                 futures.append(
-                    self.io_executor.submit(
+                    exec_for_task.submit(
                         BaseMultimodalProcessor._load_single_item,
                         data,
                         modality,
@@ -497,7 +503,8 @@ class BaseMultimodalProcessor(ABC):
                         if frames:
                             # only for minicpmv
                             images += frames
-                            new_text_parts += mm_tokens * len(frames)
+                            # Fast append the correct number of image tokens
+                            new_text_parts.append(mm_tokens * len(frames))
                     elif modality == Modality.VIDEO:
                         # load as video
                         mm_tokens = (
@@ -506,7 +513,7 @@ class BaseMultimodalProcessor(ABC):
                             else multimodal_tokens.video_token
                         )
                         videos += [result]
-                        new_text_parts += mm_tokens
+                        new_text_parts.append(mm_tokens)
                     elif modality == Modality.AUDIO:
                         # audio
                         mm_tokens = (
@@ -515,10 +522,10 @@ class BaseMultimodalProcessor(ABC):
                             else multimodal_tokens.audio_token
                         )
                         audios += [result]
-                        new_text_parts += mm_tokens
+                        new_text_parts.append(mm_tokens)
                 else:
                     # normal text
-                    new_text_parts += [text_part]
+                    new_text_parts.append(text_part)
 
             except Exception as e:
                 raise RuntimeError(

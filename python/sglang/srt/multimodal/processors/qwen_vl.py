@@ -86,8 +86,7 @@ def resize_image(
     size_factor: int = IMAGE_FACTOR,
 ) -> Image.Image:
     width, height = image.size
-    min_pixels = min_pixels
-    max_pixels = max_pixels
+    # Compute the target size per Qwen policy
     resized_height, resized_width = smart_resize(
         height,
         width,
@@ -95,8 +94,11 @@ def resize_image(
         min_pixels=min_pixels,
         max_pixels=max_pixels,
     )
-    image = image.resize((resized_width, resized_height), resample=RESIZE_RESAMPLE)
-    return image
+    # Fast pass: if already at the target size, skip resizing
+    if resized_width == width and resized_height == height:
+        return image
+
+    return image.resize((resized_width, resized_height), resample=RESIZE_RESAMPLE)
 
 
 def round_by_factor(number: int, factor: int) -> int:
@@ -302,8 +304,13 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         rid = getattr(request_obj, "rid", "anonymous_rid")
 
         # Qwen-specific: resize images if they are raw Image objects
+        # Offload to ProcessPool to avoid event-loop CPU work and GIL contention.
         if base_output.images and isinstance(base_output.images[0], Image.Image):
-            resize_tasks = [resize_image_async(image) for image in base_output.images]
+            loop = asyncio.get_event_loop()
+            resize_tasks = [
+                loop.run_in_executor(self.cpu_executor, resize_image, image)
+                for image in base_output.images
+            ]
             base_output.images = await asyncio.gather(*resize_tasks)
 
         video_metadata = None
