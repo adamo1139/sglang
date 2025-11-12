@@ -23,6 +23,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 )
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.utils import logger
+from sglang.srt.utils import load_image
 
 IMAGE_FACTOR = 28
 MIN_PIXELS = 4 * 28 * 28
@@ -99,6 +100,20 @@ def resize_image(
         return image
 
     return image.resize((resized_width, resized_height), resample=RESIZE_RESAMPLE)
+
+
+# Top-level helper to allow pickling in ProcessPool
+def _qwen_load_and_resize(url_or_bytes: Union[str, bytes, Image.Image]):
+    """Load an image (URL/path/base64/bytes/PIL) and apply Qwen smart resize.
+
+    Returns a PIL.Image resized per Qwen policy. Designed to run inside ProcessPool.
+    """
+    try:
+        img, _ = load_image(url_or_bytes)
+        return resize_image(img)
+    except Exception as e:
+        # Raise a simple exception to be caught by the fast-path fallback logic.
+        raise RuntimeError(f"load+resize failed: {e}")
 
 
 def round_by_factor(number: int, factor: int) -> int:
@@ -293,6 +308,117 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         **kwargs,
     ):
         entry_time = time.perf_counter()
+        rid = getattr(request_obj, "rid", "anonymous_rid")
+
+        # Qwen image_url fast path (images-only, placeholders match, feature-flagged)
+        fastpath_enabled = os.getenv("SGLANG_QWEN_URL_FASTPATH", "1") not in {"0", "false", "False"}
+        try:
+            has_video = bool(getattr(request_obj, "video_data", None))
+            has_audio = bool(getattr(request_obj, "audio_data", None))
+            # Only enable for image-only requests
+            if fastpath_enabled and not has_video and not has_audio and image_data:
+                # Count placeholders in the input text using the Qwen regex span
+                placeholder_count = 0
+                try:
+                    if self.mm_tokens.image_token_regex is not None and isinstance(input_text, str):
+                        placeholder_count = len(self.mm_tokens.image_token_regex.findall(input_text))
+                except Exception:
+                    placeholder_count = 0
+
+                # Ensure counts match; if mismatch, fall back to generic path
+                if placeholder_count == len(image_data):
+                    loop = asyncio.get_event_loop()
+                    # Fused load+resize on ProcessPool
+                    lr_start = time.perf_counter()
+                    load_resize_tasks = [
+                        loop.run_in_executor(self.cpu_executor, _qwen_load_and_resize, data)
+                        for data in image_data
+                    ]
+                    loaded_resized_images = await asyncio.gather(*load_resize_tasks)
+                    lr_end = time.perf_counter()
+
+                    # Direct HF processor call to get items and input_ids
+                    hf_start = time.perf_counter()
+                    mm_items, input_ids, ret = await loop.run_in_executor(
+                        self.io_executor,
+                        lambda: self._process_and_collect_mm_items(
+                            input_text=input_text, images=loaded_resized_images
+                        ),
+                    )
+                    hf_end = time.perf_counter()
+
+                    # Compute offsets via start/end pair tokens for robustness
+                    offsets = self.get_mm_items_offset_by_pair(
+                        input_ids=input_ids, mm_start_id=self.IM_START_TOKEN_ID, mm_end_id=self.IM_END_TOKEN_ID
+                    )
+                    for mm_item in mm_items:
+                        # Assign offsets only for image modality item(s)
+                        try:
+                            # MultimodalDataItem provides is_image() typically; fallback via modality name
+                            if getattr(mm_item, "is_image", None) and mm_item.is_image():
+                                mm_item.offsets = offsets
+                            elif getattr(mm_item, "modality", None) is not None:
+                                # Modality enum string check without importing here
+                                if str(getattr(mm_item, "modality")).lower().endswith("image"):
+                                    mm_item.offsets = offsets
+                        except Exception:
+                            pass
+
+                    # Compute mRoPE positions as in the generic path
+                    second_per_grid_ts = getattr(ret, "second_per_grid_ts", None) or getattr(
+                        ret, "video_second_per_grid", None
+                    )
+
+                    input_ids = input_ids.flatten()
+
+                    mrope_positions, mrope_position_delta = MRotaryEmbedding.get_rope_index(
+                        spatial_merge_size=self.hf_config.vision_config.spatial_merge_size,
+                        image_token_id=self.mm_tokens.image_token_id,
+                        video_token_id=self.mm_tokens.video_token_id,
+                        vision_start_token_id=self.vision_start_token_id,
+                        model_type=self.model_type,
+                        tokens_per_second=getattr(
+                            self.hf_config.vision_config, "tokens_per_second", None
+                        ),
+                        input_ids=input_ids.unsqueeze(0),
+                        image_grid_thw=getattr(ret, "image_grid_thw", None),
+                        video_grid_thw=getattr(ret, "video_grid_thw", None),
+                        second_per_grid_ts=second_per_grid_ts,
+                        use_audio_in_video=False,
+                        audio_seqlens=None,
+                        audio_token_id=getattr(self.hf_config, "audio_token_id", None),
+                        audio_start_token_id=self.audio_start_token_id,
+                        position_id_per_seconds=getattr(
+                            self.hf_config, "position_id_per_seconds", None
+                        ),
+                    )
+                    mrope_positions = mrope_positions.squeeze(1)
+
+                    logger.debug(
+                        f"[QwenVLProcessor FastPath] rid={rid}, imgs={len(image_data)}, "
+                        f"load+resize: {(lr_end - lr_start) * 1000:.2f} ms, "
+                        f"hf_process: {(hf_end - hf_start) * 1000:.2f} ms, "
+                        f"total: {(time.perf_counter() - entry_time) * 1000:.2f} ms"
+                    )
+
+                    return {
+                        "input_ids": input_ids.tolist(),
+                        "mm_items": mm_items,
+                        "im_start_id": self.IM_START_TOKEN_ID,
+                        "im_end_id": self.IM_END_TOKEN_ID,
+                        "im_token_id": self.mm_tokens.image_token_id,
+                        "video_token_id": self.mm_tokens.video_token_id,
+                        "audio_token_id": self.mm_tokens.audio_token_id,
+                        "mrope_positions": mrope_positions,
+                        "mrope_position_delta": mrope_position_delta,
+                    }
+                else:
+                    logger.debug(
+                        f"[QwenVLProcessor FastPath] rid={rid} bypass disabled: placeholders({placeholder_count}) != images({len(image_data)})"
+                    )
+        except Exception as e:
+            # Fall through to the generic path on any error
+            logger.debug(f"[QwenVLProcessor FastPath] rid={rid} fallback due to error: {e}")
         # Offload the synchronous load_mm_data to a thread executor to avoid blocking the event loop
         loop = asyncio.get_event_loop()
         base_output = await loop.run_in_executor(
@@ -306,7 +432,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             ),
         )
         load_time = time.perf_counter()
-        rid = getattr(request_obj, "rid", "anonymous_rid")
 
         # Qwen-specific: resize images if they are raw Image objects
         # Offload to ProcessPool to avoid event-loop CPU work and GIL contention.
