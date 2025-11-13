@@ -32,6 +32,8 @@ from sglang.srt.entrypoints.openai.protocol import (
     TopLogprob,
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils.common import schedule_image_prefetch
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     process_hidden_states_from_ret,
@@ -359,6 +361,16 @@ class OpenAIServingChat(OpenAIServingBase):
         audio_data = audio_data if audio_data else None
         video_data = video_data if video_data else None
         modalities = modalities if modalities else []
+        # Opportunistically prefetch image URLs early at HTTP ingress
+        if get_bool_env_var("SGLANG_ENABLE_EARLY_IMAGE_PREFETCH") and image_data:
+            try:
+                urls = self._extract_http_urls(image_data)
+                if urls:
+                    schedule_image_prefetch(urls)
+            except Exception:
+                # Best-effort only
+                pass
+
         return MessageProcessingResult(
             prompt=prompt,
             prompt_ids=prompt_ids,
@@ -421,6 +433,15 @@ class OpenAIServingChat(OpenAIServingBase):
         if not is_multimodal:
             prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
 
+        # Opportunistically prefetch image URLs early at HTTP ingress
+        if get_bool_env_var("SGLANG_ENABLE_EARLY_IMAGE_PREFETCH") and image_data:
+            try:
+                urls = self._extract_http_urls(image_data)
+                if urls:
+                    schedule_image_prefetch(urls)
+            except Exception:
+                pass
+
         return MessageProcessingResult(
             prompt=prompt,
             prompt_ids=prompt_ids,
@@ -430,6 +451,50 @@ class OpenAIServingChat(OpenAIServingBase):
             modalities=modalities,
             stop=stop,
         )
+
+    @staticmethod
+    def _extract_http_urls(image_data: Any) -> list[str]:
+        urls: list[str] = []
+
+        def rec(obj: Any) -> None:
+            if obj is None:
+                return
+            if isinstance(obj, str):
+                if obj.startswith("http://") or obj.startswith("https://"):
+                    urls.append(obj)
+                return
+            if isinstance(obj, list):
+                for it in obj:
+                    rec(it)
+                return
+            if isinstance(obj, dict):
+                # Common shapes: {"url": "..."} or {"image_url": {"url": "..."}}
+                u = obj.get("url")
+                if isinstance(u, str) and (u.startswith("http://") or u.startswith("https://")):
+                    urls.append(u)
+                iu = obj.get("image_url")
+                if isinstance(iu, dict):
+                    v = iu.get("url")
+                    if isinstance(v, str) and (v.startswith("http://") or v.startswith("https://")):
+                        urls.append(v)
+                # Recurse other values to capture nested structures
+                for v in obj.values():
+                    rec(v)
+                return
+            # Dataclass-like ImageData with ".url"
+            u = getattr(obj, "url", None)
+            if isinstance(u, str) and (u.startswith("http://") or u.startswith("https://")):
+                urls.append(u)
+
+        rec(image_data)
+        # Deduplicate while preserving order
+        seen = set()
+        unique_urls = []
+        for u in urls:
+            if u not in seen:
+                seen.add(u)
+                unique_urls.append(u)
+        return unique_urls
 
     async def _handle_streaming_request(
         self,

@@ -913,6 +913,16 @@ async def load_image_async(
     if isinstance(image_file, str):
         # URL path
         if image_file.startswith("http://") or image_file.startswith("https://"):
+            # Prefer prefetched bytes if available (set by schedule_image_prefetch)
+            try:
+                _PREFETCH_BYTES  # type: ignore
+            except NameError:
+                _PREFETCH_BYTES = {}  # type: ignore
+            cached_bytes = _PREFETCH_BYTES.pop(image_file, None)  # type: ignore
+            if cached_bytes is not None:
+                img = Image.open(BytesIO(cached_bytes))
+                img.load()
+                return img, (img.width, img.height)
             client = await _get_async_http_client()
             timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
             if client is None:
@@ -991,6 +1001,74 @@ def get_image_bytes(image_file: Union[str, bytes]):
         return pybase64.b64decode(image_file, validate=True)
     else:
         raise NotImplementedError(f"Invalid image: {image_file}")
+
+
+# Early image prefetch support
+async def _fetch_and_store_image_bytes(url: str) -> None:
+    try:
+        client = await _get_async_http_client()
+        if client is None:
+            return
+        timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
+        resp = await client.get(url, timeout=timeout)
+        resp.raise_for_status()
+        content = resp.content
+        # Initialize caches on first use
+        global _PREFETCH_BYTES, _PREFETCH_INFLIGHT
+        try:
+            _PREFETCH_BYTES
+        except NameError:
+            _PREFETCH_BYTES = {}
+        try:
+            _PREFETCH_INFLIGHT
+        except NameError:
+            _PREFETCH_INFLIGHT = set()
+        _PREFETCH_BYTES[url] = content
+        _PREFETCH_INFLIGHT.discard(url)
+        # Bound cache size (FIFO-like)
+        max_entries = int(os.getenv("SGLANG_IMAGE_PREFETCH_CACHE_SIZE", "512"))
+        if len(_PREFETCH_BYTES) > max_entries:
+            while len(_PREFETCH_BYTES) > max_entries:
+                try:
+                    _PREFETCH_BYTES.pop(next(iter(_PREFETCH_BYTES)))
+                except StopIteration:
+                    break
+    except Exception:
+        try:
+            _PREFETCH_INFLIGHT.discard(url)  # type: ignore
+        except Exception:
+            pass
+
+
+def schedule_image_prefetch(urls: list[str]) -> None:
+    """Fire-and-forget prefetch of image URLs on the current event loop.
+
+    Stores raw bytes in a small per-process cache so downstream async loaders can pick them up.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    global _PREFETCH_INFLIGHT, _PREFETCH_BYTES
+    try:
+        _PREFETCH_INFLIGHT
+    except NameError:
+        _PREFETCH_INFLIGHT = set()
+    try:
+        _PREFETCH_BYTES
+    except NameError:
+        _PREFETCH_BYTES = {}
+
+    for url in urls:
+        if not isinstance(url, str):
+            continue
+        if not (url.startswith("http://") or url.startswith("https://")):
+            continue
+        if url in _PREFETCH_BYTES or url in _PREFETCH_INFLIGHT:
+            continue
+        _PREFETCH_INFLIGHT.add(url)
+        loop.create_task(_fetch_and_store_image_bytes(url))
 
 
 def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
