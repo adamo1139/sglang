@@ -1006,7 +1006,17 @@ class Scheduler(
 
     def recv_requests(self) -> List[Req]:
         """Receive results at tp_rank = 0 and broadcast it to all other TP ranks."""
-
+        # Optional coalescing to accumulate multiple arrivals before scheduling
+        if self.pp_rank == 0 and self.attn_tp_rank == 0 and self.server_args.scheduler_recv_coalesce_ms > 0:
+            try:
+                poller = zmq.Poller()
+                if self.recv_from_tokenizer is not None:
+                    poller.register(self.recv_from_tokenizer, zmq.POLLIN)
+                if self.recv_from_rpc is not None:
+                    poller.register(self.recv_from_rpc, zmq.POLLIN)
+                poller.poll(self.server_args.scheduler_recv_coalesce_ms)
+            except Exception:
+                pass
         if self.recv_skipper is not None:
             last_forward_mode = (
                 self.last_batch.forward_mode if self.last_batch is not None else None

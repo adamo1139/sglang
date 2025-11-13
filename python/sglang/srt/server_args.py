@@ -510,6 +510,8 @@ class ServerArgs:
     keep_mm_feature_on_device: bool = False
     enable_return_hidden_states: bool = False
     scheduler_recv_interval: int = 1
+    # Optional small coalescing window (ms) to accumulate incoming requests per scheduler loop
+    scheduler_recv_coalesce_ms: int = 0
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
     rl_on_policy_target: Optional[str] = None
@@ -3415,6 +3417,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.scheduler_recv_interval,
             help="The interval to poll requests in scheduler. Can be set to >1 to reduce the overhead of this.",
+        )
+        parser.add_argument(
+            "--scheduler-recv-coalesce-ms",
+            type=int,
+            default=ServerArgs.scheduler_recv_coalesce_ms,
+            help="Optional small coalescing window in milliseconds before each scheduler receive to accumulate arrivals.",
         )
         parser.add_argument(
             "--numa-node",
