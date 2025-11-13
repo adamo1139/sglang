@@ -137,7 +137,11 @@ async def resize_image_async(
     max_pixels: int = MAX_PIXELS,
     size_factor: int = IMAGE_FACTOR,
 ):
-    return resize_image(image, min_pixels, max_pixels, size_factor)
+    """Async wrapper that offloads resizing to the default executor to avoid blocking the event loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, lambda: resize_image(image, min_pixels, max_pixels, size_factor)
+    )
 
 
 def smart_nframes(
@@ -327,7 +331,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
                 # Ensure counts match; if mismatch, fall back to generic path
                 if placeholder_count == len(image_data):
-                    loop = asyncio.get_event_loop()
+                    loop = asyncio.get_running_loop()
                     # Fused load+resize on ProcessPool
                     lr_start = time.perf_counter()
                     load_resize_tasks = [
@@ -420,23 +424,19 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             # Fall through to the generic path on any error
             logger.debug(f"[QwenVLProcessor FastPath] rid={rid} fallback due to error: {e}")
         # Offload the synchronous load_mm_data to a thread executor to avoid blocking the event loop
-        loop = asyncio.get_event_loop()
-        base_output = await loop.run_in_executor(
-            self.io_executor,
-            lambda: self.load_mm_data(
-                prompt=input_text,
-                image_data=image_data,
-                video_data=request_obj.video_data,
-                audio_data=request_obj.audio_data,
-                multimodal_tokens=self.mm_tokens,
-            ),
+        base_output = await self.load_mm_data_async(
+            prompt=input_text,
+            image_data=image_data,
+            video_data=getattr(request_obj, "video_data", None),
+            audio_data=getattr(request_obj, "audio_data", None),
+            multimodal_tokens=self.mm_tokens,
         )
         load_time = time.perf_counter()
 
         # Qwen-specific: resize images if they are raw Image objects
         # Offload to ProcessPool to avoid event-loop CPU work and GIL contention.
         if base_output.images and isinstance(base_output.images[0], Image.Image):
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             resize_tasks = [
                 loop.run_in_executor(self.cpu_executor, resize_image, image)
                 for image in base_output.images
@@ -454,6 +454,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         preprocess_time = time.perf_counter()
 
         # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
+        loop = asyncio.get_running_loop()
         if self.hf_config.model_type in ("qwen3_vl", "qwen3_vl_moe"):
             mm_items, input_ids, ret = await loop.run_in_executor(
                 self.io_executor,
