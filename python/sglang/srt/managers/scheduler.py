@@ -1828,6 +1828,35 @@ class Scheduler(
         if len(can_run_list) == 0:
             return None
 
+        # Optional: enforce a minimum prefill batch size with a bounded wait
+        # Skip gating when we have an in-progress or newly created chunked prefill request
+        if (
+            self.server_args.prefill_min_new_seq > 0
+            and self.chunked_req is None
+            and adder.new_chunked_req is None
+            and len(can_run_list) < self.server_args.prefill_min_new_seq
+        ):
+            allow_dispatch = False
+            wait_ms = self.server_args.prefill_min_wait_ms
+            if wait_ms > 0:
+                try:
+                    oldest = min(r.time_stats.wait_queue_entry_time for r in can_run_list)
+                    age = (time.perf_counter() - oldest) * 1000.0
+                    if age >= wait_ms:
+                        allow_dispatch = True
+                except Exception:
+                    # If anything goes wrong with time accounting, fail open
+                    allow_dispatch = True
+            # Defer this prefill batch to gather more requests
+            if not allow_dispatch:
+                # Ensure we keep accepting new work and avoid marking the batch as full
+                self.running_batch.batch_is_full = False
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        f"Deferring prefill: #new-seq={len(can_run_list)} < min={self.server_args.prefill_min_new_seq}, wait up to {wait_ms} ms"
+                    )
+                return None
+
         if self.enable_metrics:
             # only record queue time when enable_metrics is True to avoid overhead
             for req in can_run_list:

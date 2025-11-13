@@ -512,6 +512,10 @@ class ServerArgs:
     scheduler_recv_interval: int = 1
     # Optional small coalescing window (ms) to accumulate incoming requests per scheduler loop
     scheduler_recv_coalesce_ms: int = 0
+    # Minimum number of new sequences to include in a prefill batch before dispatching (0 disables)
+    prefill_min_new_seq: int = 0
+    # Optional maximum wait time in milliseconds to satisfy prefill_min_new_seq; 0 disables waiting
+    prefill_min_wait_ms: int = 0
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
     rl_on_policy_target: Optional[str] = None
@@ -3423,6 +3427,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.scheduler_recv_coalesce_ms,
             help="Optional small coalescing window in milliseconds before each scheduler receive to accumulate arrivals.",
+        )
+        parser.add_argument(
+            "--prefill-min-new-seq",
+            type=int,
+            default=ServerArgs.prefill_min_new_seq,
+            help="Minimum number of new sequences to include in a prefill batch. 0 disables (default).",
+        )
+        parser.add_argument(
+            "--prefill-min-wait-ms",
+            type=int,
+            default=ServerArgs.prefill_min_wait_ms,
+            help="Maximum extra wait time in milliseconds to try to meet --prefill-min-new-seq before dispatching. 0 disables waiting.",
         )
         parser.add_argument(
             "--numa-node",
