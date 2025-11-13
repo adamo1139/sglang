@@ -152,6 +152,7 @@ class LinearBase(torch.nn.Module):
         params_dtype: Optional[torch.dtype] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        disable_tp: bool = False,
     ):
         super().__init__()
 
@@ -167,6 +168,8 @@ class LinearBase(torch.nn.Module):
             self.quant_method: Optional[QuantizeMethodBase] = UnquantizedLinearMethod()
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
+        # Whether to disable TP sharding for this layer
+        self.disable_tp = disable_tp
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
@@ -297,12 +300,13 @@ class ColumnParallelLinear(LinearBase):
         quant_config: Optional[QuantizationConfig] = None,
         output_sizes: Optional[List[int]] = None,
         prefix: str = "",
+        disable_tp: bool = False,
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
     ):
         super().__init__(
-            input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
+            input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix, disable_tp=disable_tp
         )
 
         self.gather_output = gather_output
@@ -310,9 +314,9 @@ class ColumnParallelLinear(LinearBase):
 
         # Divide the weight matrix along the last dimension.
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
         self.tp_rank, self.tp_size = tp_rank, tp_size
         assert self.quant_method is not None
         self.output_size_per_partition = divide(self.output_size, tp_size)
@@ -480,12 +484,13 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
+        disable_tp: bool = False,
     ):
         self.output_sizes = output_sizes
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
         self.tp_rank, self.tp_size = tp_rank, tp_size
         assert all(output_size % tp_size == 0 for output_size in output_sizes)
         self.use_presharded_weights = use_presharded_weights
@@ -501,6 +506,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             tp_rank=tp_rank,
             tp_size=tp_size,
             use_presharded_weights=use_presharded_weights,
+            disable_tp=disable_tp,
         )
         self.prefix = prefix
 
@@ -800,6 +806,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         load_presharded_attn: bool = False,
+        disable_tp: bool = False,
     ):
         self.hidden_size = hidden_size
         self.head_size = head_size
@@ -809,9 +816,9 @@ class QKVParallelLinear(ColumnParallelLinear):
         self.total_num_kv_heads = total_num_kv_heads
         # Divide the weight matrix along the last dimension.
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
         self.tp_rank, self.tp_size = tp_rank, tp_size
         self.num_heads = divide(self.total_num_heads, tp_size)
         if tp_size >= self.total_num_kv_heads:
@@ -846,6 +853,7 @@ class QKVParallelLinear(ColumnParallelLinear):
             tp_rank=tp_rank,
             tp_size=tp_size,
             use_presharded_weights=self.use_presharded_weights,
+            disable_tp=disable_tp,
         )
 
     def _get_shard_offset_mapping(self, loaded_shard_id: str):
@@ -1233,10 +1241,11 @@ class RowParallelLinear(LinearBase):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
+        disable_tp: bool = False,
     ):
         quant_config = None if _disable_hip_linear_quant else quant_config
         super().__init__(
-            input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
+            input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix, disable_tp=disable_tp
         )
 
         self.input_is_parallel = input_is_parallel
@@ -1244,9 +1253,9 @@ class RowParallelLinear(LinearBase):
 
         # Divide the weight matrix along the last dimension.
         if tp_rank is None:
-            tp_rank = get_tensor_model_parallel_rank()
+            tp_rank = get_tensor_model_parallel_rank() if not disable_tp else 0
         if tp_size is None:
-            tp_size = get_tensor_model_parallel_world_size()
+            tp_size = get_tensor_model_parallel_world_size() if not disable_tp else 1
         self.tp_rank, self.tp_size = tp_rank, tp_size
         self.input_size_per_partition = divide(input_size, self.tp_size)
         assert self.quant_method is not None

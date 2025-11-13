@@ -480,6 +480,7 @@ class VisionAttention(nn.Module):
         customized_position_embedding_applier: Callable[
             [torch.Tensor, torch.Tensor, Any, Any], Tuple[torch.Tensor, torch.Tensor]
         ] = None,
+        disable_tp: bool = False,
         **kwargs,
     ):
         super().__init__()
@@ -549,6 +550,7 @@ class VisionAttention(nn.Module):
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 prefix=add_prefix("qkv_proj", prefix),
+                disable_tp=disable_tp,
             )
         else:
             self.qkv_proj = ColumnParallelLinear(
@@ -559,6 +561,7 @@ class VisionAttention(nn.Module):
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
                 prefix=add_prefix("qkv_proj", prefix),
+                disable_tp=disable_tp,
             )
         self.proj = RowParallelLinear(
             input_size=self.dummy_dim,
@@ -568,6 +571,7 @@ class VisionAttention(nn.Module):
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
             prefix=add_prefix("proj", prefix),
+            disable_tp=disable_tp,
         )
 
     def _determine_attention_backend(self, passed_backend: Optional[str]) -> str:

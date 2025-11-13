@@ -555,6 +555,8 @@ class ServerArgs:
     # For Multi-Modal
     mm_max_concurrent_calls: int = 32
     mm_per_request_timeout: float = 10.0
+    # Enable data-parallel multimodal encoders (e.g., vision)
+    enable_dp_multimodal_encoder: bool = False
 
     # For checkpoint decryption
     decrypted_config_file: Optional[str] = None
@@ -3613,6 +3615,11 @@ class ServerArgs:
             type=int,
             default=ServerArgs.mm_per_request_timeout,
             help="The timeout for each multi-modal request in seconds.",
+        )
+        parser.add_argument(
+            "--enable-dp-multimodal-encoder",
+            action="store_true",
+            help="Enable data-parallel execution for multimodal encoders (e.g., Qwen2.5-VL vision).",
         )
 
         # For checkpoint decryption
