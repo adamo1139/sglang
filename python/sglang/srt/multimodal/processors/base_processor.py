@@ -24,6 +24,7 @@ from sglang.srt.utils import (
     load_video,
     logger,
 )
+from sglang.srt.utils.common import load_image_async
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     MM_FEATURE_CACHE_SIZE,
     CudaIpcTensorTransportProxy,
@@ -595,15 +596,25 @@ class BaseMultimodalProcessor(ABC):
                             "Mismatch between image tokens and estimated frame counts."
                         )
 
-                fn = partial(
-                    BaseMultimodalProcessor._load_single_item,
-                    data,
-                    modality,
-                    frame_count_limit,
-                    audio_sample_rate,
-                    discard_alpha_channel,
-                )
-                futures.append(loop.run_in_executor(self.io_executor, fn))
+                # Prefer true-async image fetches for URL inputs
+                if modality == Modality.IMAGE and not isinstance(data, dict):
+                    async def _load_img(d=data, discard=discard_alpha_channel):
+                        img, _ = await load_image_async(d)
+                        if discard and hasattr(img, "mode") and img.mode != "RGB":
+                            img = img.convert("RGB")
+                        return img
+
+                    futures.append(asyncio.create_task(_load_img()))
+                else:
+                    fn = partial(
+                        BaseMultimodalProcessor._load_single_item,
+                        data,
+                        modality,
+                        frame_count_limit,
+                        audio_sample_rate,
+                        discard_alpha_channel,
+                    )
+                    futures.append(loop.run_in_executor(self.io_executor, fn))
                 task_info.append((modality, data, frame_count_limit))
 
         # Drain any leftover iterators to detect extra inputs

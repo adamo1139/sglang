@@ -47,6 +47,7 @@ import uuid
 import warnings
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
+import asyncio
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
@@ -853,6 +854,90 @@ def load_audio(
 class ImageData:
     url: str
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
+
+
+async def _get_async_http_client():
+    """Return a shared httpx.AsyncClient honoring SGLANG_HTTP_POOL_MAXSIZE.
+
+    Falls back to None if httpx is unavailable.
+    """
+    try:
+        import httpx  # type: ignore
+    except Exception:
+        return None
+
+    # Singleton per process
+    global _ASYNC_HTTP_CLIENT, _ASYNC_HTTP_CLIENT_LOCK  # type: ignore
+    try:
+        _ASYNC_HTTP_CLIENT
+    except NameError:
+        _ASYNC_HTTP_CLIENT = None  # type: ignore
+        _ASYNC_HTTP_CLIENT_LOCK = asyncio.Lock()  # type: ignore
+
+    if _ASYNC_HTTP_CLIENT is not None:  # type: ignore
+        return _ASYNC_HTTP_CLIENT  # type: ignore
+
+    async with _ASYNC_HTTP_CLIENT_LOCK:  # type: ignore
+        if _ASYNC_HTTP_CLIENT is not None:  # type: ignore
+            return _ASYNC_HTTP_CLIENT  # type: ignore
+        pool_size = int(os.getenv("SGLANG_HTTP_POOL_MAXSIZE", "256"))
+        limits = httpx.Limits(
+            max_keepalive_connections=pool_size,
+            max_connections=pool_size,
+            keepalive_expiry=30.0,
+        )
+        _ASYNC_HTTP_CLIENT = httpx.AsyncClient(limits=limits, timeout=30.0)  # type: ignore
+        return _ASYNC_HTTP_CLIENT  # type: ignore
+
+
+async def load_image_async(
+    image_file: Union[Image.Image, str, ImageData, bytes],
+):
+    """Async version of load_image using pooled HTTP client for URLs.
+
+    Returns (PIL.Image, (width, height) or None if not known beforehand).
+    """
+    if isinstance(image_file, ImageData):
+        image_file = image_file.url
+
+    # Fast path for PIL.Image
+    if isinstance(image_file, Image.Image):
+        return image_file, (image_file.width, image_file.height)
+
+    # Bytes payload
+    if isinstance(image_file, bytes):
+        img = Image.open(BytesIO(image_file))
+        return img, (img.width, img.height)
+
+    # String inputs
+    if isinstance(image_file, str):
+        # URL path
+        if image_file.startswith("http://") or image_file.startswith("https://"):
+            client = await _get_async_http_client()
+            timeout = int(os.getenv("REQUEST_TIMEOUT", "3"))
+            if client is None:
+                # Fallback to sync path in a thread to avoid blocking loop
+                loop = asyncio.get_running_loop()
+                return await loop.run_in_executor(
+                    None, lambda: load_image(image_file)
+                )
+            resp = await client.get(image_file, timeout=timeout)
+            resp.raise_for_status()
+            content = resp.content
+            img = Image.open(BytesIO(content))
+            # Force load to close the underlying stream reference
+            img.load()
+            return img, (img.width, img.height)
+
+        # data: URI
+        if image_file.startswith("data:"):
+            payload = image_file.split(",", 1)[1]
+            img = Image.open(BytesIO(pybase64.b64decode(payload, validate=True)))
+            return img, (img.width, img.height)
+
+        # Local file path or base64
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, lambda: load_image(image_file))
 
 
 def load_image(
